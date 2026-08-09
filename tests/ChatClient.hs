@@ -656,6 +656,7 @@ xftpServerConfig =
       prometheusInterval = Nothing,
       prometheusMetricsFile = "tests/xftp-server-metrics.txt",
       controlPort = Nothing,
+      information = Nothing,
       transportConfig = mkTransportServerConfig True (Just alpnSupportedXFTPhandshakes) False,
       responseDelay = 0
     }
