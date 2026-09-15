@@ -37,6 +37,9 @@ class NetworkObserver {
         if (prevInfo != info) {
             prevInfo = info
             setNetworkInfo(info)
+            // a call that is reconnecting restarts ICE at once when the network comes back,
+            // see spec/services/calls.md#reconnection
+            WebRTCClient.current?.networkChanged(info.online)
         }
     }
 

@@ -204,7 +204,7 @@ None of these come from a standard - nothing standardises how long an applicatio
 ## Scope
 `call.ts` and the Kotlin call layer. The chat core does not change, so the apps can be built and tested against the core libraries of the matching release.
 
-`WebRTCClient.swift` ends calls the same way (`case .disconnected, .failed: endCall()`) and needs the same rules against the native SDK; it follows separately, with the same wire format. An iOS client without it stays compatible: the message fails `decodeJSON` and is ignored.
+`WebRTCClient.swift` ends calls the same way (`case .disconnected, .failed: endCall()`) and follows the same rules against the native SDK, with the same wire format. Two rules differ in their means there: the loss is read from `RTCIceConnectionState`, since the iOS client has no `connectionState` to watch, and [the network change](#the-online-event) comes from `NetworkObserver` (`NWPathMonitor`) rather than from an `online` event. An iOS client without any of this stays compatible: the message fails `decodeJSON` and is ignored.
 
 Not covered: a transport that is gone rather than a candidate pair that is dead (a DTLS failure), which no ICE restart fixes and which needs a new `RTCPeerConnection` with the same `aesKey` and the same local streams; recovery after the app is killed; moving a call between devices. Until the first of these, R6 simply repeats until the budget runs out.
 

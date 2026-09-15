@@ -162,7 +162,9 @@ enters `CallState.Reconnecting` and ICE is restarted; the peer connection, its D
 insertable-streams key and the transceivers are all kept, so media resumes after a freeze.
 
 All of it is implemented in [`call.ts`](../../../../packages/simplex-chat-webrtc/src/call.ts); the native
-layer only renders the state.
+layer only renders the state. The iOS client follows the same rules in `WebRTCClient.swift`, against the
+native SDK: the loss is read from `RTCIceConnectionState`, which is what its delegate reports, and the
+network change comes from `NetworkObserver` instead of an `online` event.
 
 ### 6.1 Timings
 

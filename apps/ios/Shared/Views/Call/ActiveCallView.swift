@@ -175,12 +175,19 @@ struct ActiveCallView: View {
                     call.direction == .outgoing
                     ? CallController.shared.reportOutgoingCall(call: call, connectedAt: nil)
                     : CallController.shared.reportIncomingCall(call: call, connectedAt: nil)
+                    if call.callState == .reconnecting { CallSoundsPlayer.shared.stop() }
                     call.callState = .connected
-                    call.connectedAt = .now
+                    // the call continues through a reconnection, its duration is counted from the first time
+                    call.connectedAt = call.connectedAt ?? .now
                     if !wasConnected {
                         CallSoundsPlayer.shared.vibrate(long: false)
                         wasConnected = true
                     }
+                }
+                // not a WebRTCCallStatus - it is never reported to the core, see spec/services/calls.md#reconnection
+                if state.connectionState == "reconnecting" && call.callState != .reconnecting {
+                    call.callState = .reconnecting
+                    CallSoundsPlayer.shared.startConnectingCallSound()
                 }
                 if state.connectionState == "closed" {
                     closeCallView(client)
@@ -198,9 +205,10 @@ struct ActiveCallView: View {
                     }
                 }
             case let .connected(connectionInfo):
+                if call.callState == .reconnecting { CallSoundsPlayer.shared.stop() }
                 call.callState = .connected
                 call.connectionInfo = connectionInfo
-                call.connectedAt = .now
+                call.connectedAt = call.connectedAt ?? .now
                 if !wasConnected {
                     CallSoundsPlayer.shared.vibrate(long: false)
                     wasConnected = true
