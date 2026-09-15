@@ -1342,6 +1342,7 @@
   <string name="callstate_received_confirmation">received confirmation…</string>
   <string name="callstate_connecting">connecting…</string>
   <string name="callstate_connected">connected</string>
+  <string name="callstate_reconnecting">reconnecting…</string>
   <string name="callstate_ended">ended</string>
 
   <!-- CallView -->

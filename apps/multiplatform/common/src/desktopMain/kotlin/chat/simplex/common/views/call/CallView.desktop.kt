@@ -56,11 +56,19 @@ actual fun ActiveCallView() {
         is WCallResponse.Ice -> withBGApi {
           chatModel.controller.apiSendCallExtraInfo(callRh, call.contact, r.iceCandidates)
         }
+        // The call is not reported as disconnected to the core while it is reconnecting: that would mark the
+        // call item as ended, irreversibly. Spec: spec/services/calls.md#reconnection
         is WCallResponse.Connection ->
-          try {
+          if (r.state.connectionState == "reconnecting") {
+            // the state is reported on every connection state change while reconnecting, the sound starts once
+            if (call.callState != CallState.Reconnecting) CallSoundsPlayer.startConnectingCallSound(scope)
+            chatModel.activeCall.value = call.copy(callState = CallState.Reconnecting)
+          } else try {
             val callStatus = json.decodeFromString<WebRTCCallStatus>("\"${r.state.connectionState}\"")
             if (callStatus == WebRTCCallStatus.Connected) {
-              chatModel.activeCall.value = call.copy(callState = CallState.Connected, connectedAt = Clock.System.now())
+              if (call.callState == CallState.Reconnecting) CallSoundsPlayer.stop()
+              // on reconnection connectedAt is kept, the call duration is not restarted
+              chatModel.activeCall.value = call.copy(callState = CallState.Connected, connectedAt = call.connectedAt ?: Clock.System.now())
             }
             withBGApi { chatModel.controller.apiCallStatus(callRh, call.contact, callStatus) }
           } catch (e: Throwable) {

@@ -15,6 +15,7 @@ import chat.simplex.app.model.NtfManager.EndCallAction
 import chat.simplex.app.views.call.CallActivity
 import chat.simplex.common.model.NotificationPreviewMode
 import chat.simplex.common.platform.*
+import chat.simplex.common.views.call.CallState
 import chat.simplex.common.views.helpers.*
 import chat.simplex.res.MR
 import kotlinx.datetime.Instant
@@ -84,7 +85,11 @@ class CallService: Service() {
       generalGetString(MR.strings.notification_preview_somebody)
     else
       call?.contact?.profile?.displayName ?: ""
-    val text = generalGetString(if (call?.hasVideo == true) MR.strings.call_service_notification_video_call else MR.strings.call_service_notification_audio_call)
+    // the chronometer keeps running while reconnecting - the call is still in progress
+    val text = if (call?.callState == CallState.Reconnecting)
+      generalGetString(MR.strings.callstate_reconnecting)
+    else
+      generalGetString(if (call?.hasVideo == true) MR.strings.call_service_notification_video_call else MR.strings.call_service_notification_audio_call)
     val image = call?.contact?.image
     val largeIcon = if (image == null || previewMode == NotificationPreviewMode.HIDDEN.name)
       BitmapFactory.decodeResource(resources, R.drawable.icon)

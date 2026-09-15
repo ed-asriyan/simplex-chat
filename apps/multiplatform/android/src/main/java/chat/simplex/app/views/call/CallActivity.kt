@@ -255,13 +255,13 @@ fun CallActivityView() {
         )
         // callState == connected is needed in a situation when a peer enabled camera in audio call while a user didn't grant camera permission yet,
         // so no need to hide active call view in this case
-        if (permissionsState.allPermissionsGranted || call.callState == CallState.Connected) {
+        if (permissionsState.allPermissionsGranted || call.connectedOrReconnecting) {
           ActiveCallView()
           LaunchedEffect(Unit) {
             activity.startServiceAndBind()
           }
         }
-        if ((!permissionsState.allPermissionsGranted && call.callState != CallState.Connected) || call.wantsToEnableCamera) {
+        if ((!permissionsState.allPermissionsGranted && !call.connectedOrReconnecting) || call.wantsToEnableCamera) {
           CallPermissionsView(remember { m.activeCallViewIsCollapsed }.value, callHasVideo() || call.wantsToEnableCamera) {
             withBGApi { chatModel.callManager.endCall(call) }
           }

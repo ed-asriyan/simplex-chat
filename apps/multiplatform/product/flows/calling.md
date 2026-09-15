@@ -99,6 +99,7 @@ Both platforms share a common signaling flow through the Haskell core API.
 ```
 Outgoing: WaitCapabilities -> InvitationSent -> OfferSent -> AnswerReceived -> Negotiated -> Connected -> Ended
 Incoming: InvitationAccepted -> OfferReceived -> Negotiated -> Connected -> Ended
+A connected call that loses the transport: Connected -> Reconnecting -> Connected (or -> Ended)
 ```
 
 | State | Description |
@@ -111,6 +112,7 @@ Incoming: InvitationAccepted -> OfferReceived -> Negotiated -> Connected -> Ende
 | `AnswerReceived` | Caller received SDP answer |
 | `Negotiated` | ICE negotiation complete |
 | `Connected` | Media flowing |
+| `Reconnecting` | Transport lost, ICE is being restarted - see [spec](../spec/services/calls.md#reconnection) |
 | `Ended` | Call terminated |
 
 ---
@@ -124,6 +126,13 @@ Incoming: InvitationAccepted -> OfferReceived -> Negotiated -> Connected -> Ende
 5. `ChatModel.activeCall` is set to `null`.
 6. On Android, `CallService` is stopped and the `WebView` is destroyed.
 7. On Desktop, `WCallCommand.End` is sent to the browser via WebSocket, and the NanoWSD server is stopped.
+
+A lost transport is not an ended call. A connected call whose WebRTC connection reports `disconnected` or
+`failed` moves to `Reconnecting` instead: the media pipeline is kept and ICE is restarted over the chat
+connection, so a short interruption or a Wi-Fi/mobile handover resumes the call without ringing the peer
+again and without a new chat item. The call is ended by step 1 above only after 60 seconds without recovery,
+or if the peer's client has no reconnection support. See
+[spec/services/calls.md#reconnection](../spec/services/calls.md#reconnection).
 
 ---
 

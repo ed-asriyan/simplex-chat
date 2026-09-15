@@ -7,8 +7,9 @@
 3. [Android Implementation](#3-android-implementation)
 4. [Desktop Implementation](#4-desktop-implementation)
 5. [Common Call API](#5-common-call-api)
-6. [IncomingCallAlertView](#6-incomingcallalertview)
-7. [Source Files](#7-source-files)
+6. [Reconnection](#reconnection)
+7. [IncomingCallAlertView](#7-incomingcallalertview)
+8. [Source Files](#8-source-files)
 
 ## Executive Summary
 
@@ -43,6 +44,7 @@ enum class CallState {
   AnswerReceived,      // SDP answer received from peer
   Negotiated,          // ICE negotiation in progress
   Connected,           // Media flowing
+  Reconnecting,        // Transport lost, ICE is being restarted (section 6)
   Ended;               // Call terminated
 }
 ```
@@ -50,6 +52,8 @@ enum class CallState {
 **Outgoing call flow**: `WaitCapabilities` -> `InvitationSent` -> `OfferSent` -> `AnswerReceived` -> `Negotiated` -> `Connected` -> `Ended`
 
 **Incoming call flow**: `InvitationAccepted` -> `OfferReceived` -> `Negotiated` -> `Connected` -> `Ended`
+
+**On a lost transport**: `Connected` -> `Reconnecting` -> `Connected`, or -> `Ended` when recovery fails.
 
 State transitions are driven by `WCallResponse` messages from the WebRTC layer. Each transition typically triggers a corresponding API command (e.g., `apiSendCallInvitation`, `apiSendCallOffer`).
 
@@ -146,9 +150,120 @@ All functions send commands via `sendCmd()` to the chat core and return `Boolean
 
 ---
 
+<a id="reconnection"></a>
+
+## 6. Reconnection
+
+A connected call whose WebRTC connection reports `disconnected` or `failed` is not ended. `disconnected` is
+reported on the first unanswered consent check, and consent checks run every 4-6 seconds while consent only
+expires after 30 seconds ([RFC 7675](https://www.rfc-editor.org/rfc/rfc7675), section 5.1) - so the state
+usually means a blip or a network handover that invalidated the candidate pair, not a dead session. The call
+enters `CallState.Reconnecting` and ICE is restarted; the peer connection, its DTLS association, the
+insertable-streams key and the transceivers are all kept, so media resumes after a freeze.
+
+All of it is implemented in [`call.ts`](../../../../packages/simplex-chat-webrtc/src/call.ts); the native
+layer only renders the state.
+
+### 6.1 Timings
+
+| Constant | Value | Meaning |
+|---|---|---|
+| `reconnectGrace` | 2 s | wait before the first restart - most interruptions heal on their own |
+| `reconnectAfterOnline` | 10 s | a loss reported within this of the network coming back skips the grace: it is that network change, and it will not heal |
+| `reconnectAttemptTimeout` | 10 s | no recovery within this - send another restart offer |
+| `reconnectBudget` | 60 s | total, from losing the connection; then the call is ended |
+| `reconnectCheckInterval` | 2 s | poll for recovery, an ICE restart does not always change the connection state on the answering side |
+
+`window.ononline` starts a restart immediately instead of waiting out the grace period. The event can arrive
+either side of the loss being reported, and on a handover it usually arrives **first** - the new network is
+validated within a few seconds while WebRTC only notices at its next consent check. So the event both starts
+a restart when a reconnection is already running, and is remembered (`lastOnlineAt`) so that a loss reported
+shortly after it skips the grace period.
+
+On Android that event does not fire on its own: in a WebView `navigator.onLine` is whatever the app last
+passed to [`WebView.setNetworkAvailable()`](https://developer.android.com/reference/android/webkit/WebView#setNetworkAvailable(boolean))
+and defaults to `true`. [`WebRTCView`](../../common/src/androidMain/kotlin/chat/simplex/common/views/call/CallView.android.kt)
+forwards `chatModel.networkInfo`, which [`NetworkObserver`](../../common/src/androidMain/kotlin/chat/simplex/common/helpers/NetworkObserver.kt)
+already maintains from `registerDefaultNetworkCallback` with `NET_CAPABILITY_VALIDATED`. A handover usually
+produces no offline state there at all -- `NetworkObserver` debounces it by 3 seconds, and the new network is
+up before that -- so the property is toggled to `false` and back on every network change to force the event.
+
+### 6.2 Roles
+
+The roles are those of the offer/answer model (RFC 3264): the offerer is the party that generated the
+session description, the answerer the party that replied. An ICE restart is an offer, so the offerer - the
+callee, which took the `start` command path - is the only one that sends restart offers (`Call.isOfferer`);
+the caller only answers. Offers therefore cannot collide, and no SDP rollback is needed - rollback cannot be
+relied on in the WebView versions that `webView69Or70()` exists for. If the offerer is the side that lost the
+network, its offer is queued by the agent and delivered when the network returns.
+
+### 6.3 Signaling
+
+Restart offers and answers are sent as `WCallResponse.Ice`, that is through `apiSendCallExtraInfo` and
+`x.call.extra`, which the core accepts in `CallNegotiated` on both sides and whose payload it never parses.
+Nothing in the chat core changes.
+
+The decompressed payload of `ice` is a union: an array is candidates, as before, and an object is a
+reconnection message (`ReconnectMessage` in `call.ts`):
+
+```jsonc
+{"t": "restartOffer" | "restartAnswer", "gen": 3, "sdp": "v=0\r\n…", "candidates": [...]}
+{"t": "candidates", "gen": 3, "candidates": [...]}
+```
+
+`gen` is monotonic per call. Answers and candidates of a superseded generation are dropped, and candidates
+that arrive before the description of their generation is applied are buffered in
+`ReconnectState.pendingCandidates` - the same problem `afterCallInitializedCandidates` solves at call setup.
+`getIceCandidates` is re-armed per generation, with the timings of the initial exchange.
+
+A restart may not change the media of the call: `sameMediaSections` compares the `m=` sections of the new
+description with the previous one, and the call is ended if they differ - otherwise a peer could add a track
+mid-call through a restart.
+
+### 6.4 Capability
+
+`rtcSession` in `x.call.offer` / `x.call.answer` is also an opaque payload, and unknown keys are ignored both
+by `RTCSessionDescription` and by the iOS client, so support is announced in it:
+
+```jsonc
+{"type": "offer", "sdp": "…", "smpReconnect": 1}
+```
+
+Without the flag from the peer, `canReconnect` is false and the call ends on `disconnected` as before, so
+nobody waits out the budget for a client that will never answer. If a restart message does reach a client
+without support, `addIceCandidates` throws on the non-iterable object and the `try`/`catch` in
+`processCommand` turns it into an `error` response - the call is unaffected.
+
+### 6.5 Call status
+
+While reconnecting, `connectionState` is reported to the native layer as `"reconnecting"` and **no**
+`apiCallStatus` is sent, until the call is connected again. The report is suppressed for every state, not only
+for the lost ones: an ICE restart takes the connection through `"connecting"`, and both states damage the call
+item in `callStatusItemContent`:
+
+| reported | effect on an in-progress call item |
+|---|---|
+| `WCSDisconnected` | `CISCallProgress` -> `CISCallEnded`, and `(CISCallEnded, _)` -> nothing: the item can never leave "ended" |
+| `WCSConnecting` | -> `CISCallNegotiated`. A successful reconnection returns it to `CISCallProgress`, but a call ended while in `CISCallNegotiated` matches `(Just _, WCSDisconnected) -> (CISCallEnded, 0)` and is recorded with a zero duration |
+
+`WCSDisconnected` is sent once, when the call really ends. `connectedAt` is kept on recovery, so the duration
+shown in the UI does not restart. `updated_at`, from which the stored duration is computed, is not affected by
+these updates at all: `updatedChatItem` does not touch it and `updateDirectChatItem_` writes back the value it
+read.
+
+`"reconnecting"` is not a `WebRTCCallStatus` value: the existing `json.decodeFromString` of an unknown status
+throws and is logged as not used, so a native layer without this change cannot mis-report the call.
+
+The native layer also plays `CallSoundsPlayer.startConnectingCallSound` while reconnecting - the same sound as
+when a call is being established - and stops it when the connection is back. The state is reported on every
+connection state change while reconnecting, so the sound is started only on the transition into
+`CallState.Reconnecting`.
+
+---
+
 <a id="IncomingCallAlertView"></a>
 
-## 6. IncomingCallAlertView
+## 7. IncomingCallAlertView
 
 [`IncomingCallAlertView.kt`](../../common/src/commonMain/kotlin/chat/simplex/common/views/call/IncomingCallAlertView.kt) (128 lines)
 
@@ -160,13 +275,13 @@ An in-app notification banner shown when a call invitation arrives while the app
 
 ---
 
-## 7. Source Files
+## 8. Source Files
 
 | File | Path | Lines | Description |
 |---|---|---|---|
 | `CallView.kt` | [`common/src/commonMain/.../views/call/CallView.kt`](../../common/src/commonMain/kotlin/chat/simplex/common/views/call/CallView.kt) | 28 | `expect fun ActiveCallView()`, delivery receipt waiting |
-| `CallView.android.kt` | [`common/src/androidMain/.../views/call/CallView.android.kt`](../../common/src/androidMain/kotlin/chat/simplex/common/views/call/CallView.android.kt) | 891 | Android WebView WebRTC, overlay, permissions |
-| `CallView.desktop.kt` | [`common/src/desktopMain/.../views/call/CallView.desktop.kt`](../../common/src/desktopMain/kotlin/chat/simplex/common/views/call/CallView.desktop.kt) | 263 | Desktop browser WebRTC via NanoWSD |
+| `CallView.android.kt` | [`common/src/androidMain/.../views/call/CallView.android.kt`](../../common/src/androidMain/kotlin/chat/simplex/common/views/call/CallView.android.kt) | 916 | Android WebView WebRTC, overlay, permissions |
+| `CallView.desktop.kt` | [`common/src/desktopMain/.../views/call/CallView.desktop.kt`](../../common/src/desktopMain/kotlin/chat/simplex/common/views/call/CallView.desktop.kt) | 309 | Desktop browser WebRTC via NanoWSD |
 | `CallActivity.kt` | [`android/src/main/java/.../views/call/CallActivity.kt`](../../android/src/main/java/chat/simplex/app/views/call/CallActivity.kt) | 464 | Android call Activity, PiP, lock screen |
 | `CallService.kt` | [`android/src/main/java/.../CallService.kt`](../../android/src/main/java/chat/simplex/app/CallService.kt) | 207 | Android foreground service for calls |
 | `CallManager.kt` | [`common/src/commonMain/.../views/call/CallManager.kt`](../../common/src/commonMain/kotlin/chat/simplex/common/views/call/CallManager.kt) | 119 | Call lifecycle management |

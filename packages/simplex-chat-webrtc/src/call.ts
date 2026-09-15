@@ -263,7 +263,7 @@ interface WVAPICall {
 
 interface Call {
   connection: RTCPeerConnection
-  iceCandidates: Promise<string> // JSON strings for RTCIceCandidate
+  iceCandidates: Promise<RTCIceCandidate[]>
   localMediaSources: CallMediaSources
   localCamera: VideoCamera
   localStream: MediaStream
@@ -281,6 +281,57 @@ interface Call {
   // controls whether transceiver's track was replaced already or set initially (in video call)
   cameraTrackWasSetBefore: boolean
   peerHasOldVersion: boolean
+  // the party that created the initial offer restarts ICE, the other party only answers - see reconnection below
+  isOfferer: boolean
+  // indicates whether the peer supports call reconnection
+  peerSupportsReconnect: boolean
+  // if the call was ever connected, true; otherwise false
+  wasConnected: boolean
+  // Restart generations are monotonic for the whole call, not per reconnection: they outlive the recovery,
+  // so that an offer of an already superseded generation, still in flight when the call recovered, is
+  // ignored instead of starting a new reconnection on a healthy connection.
+  // Incremented on every restart offer and echoed in the answer.
+  restartGen: number
+  // the generation whose description is applied - candidates may only be added after it
+  appliedGen: number
+  reconnect?: ReconnectState
+}
+
+interface ReconnectState {
+  // Date.now() when the connection was lost, the whole reconnection is bounded by reconnectBudget from it
+  since: number
+  graceTimer?: number
+  attemptTimer?: number
+  budgetTimer?: number
+  // an ICE restart does not always produce a connection state change on the answering side,
+  // so the recovery is also detected by polling
+  checkTimer?: number
+  // candidates of the new generation that arrived before its description was applied
+  pendingCandidates: RTCIceCandidateInit[]
+}
+
+// Sent as the payload of "ice" instead of an array of candidates, see spec/services/calls.md#reconnection.
+// An array of candidates is still sent while the call has never reconnected, so that a peer without
+// reconnection support keeps receiving trickled candidates in the shape it understands.
+type ReconnectMessage = RestartSession | RestartCandidates
+
+interface RestartSession {
+  t: "restartOffer" | "restartAnswer"
+  gen: number
+  sdp: string
+  candidates: RTCIceCandidateInit[]
+}
+
+interface RestartCandidates {
+  t: "candidates"
+  gen: number
+  candidates: RTCIceCandidateInit[]
+}
+
+// The session description is an opaque payload for the chat core, and unknown keys are ignored both by
+// RTCSessionDescription and by the iOS client, so support for reconnection is announced in it.
+interface SessionWithCapability extends RTCSessionDescriptionInit {
+  smpReconnect?: number
 }
 
 interface NotConnectedCall {
@@ -306,6 +357,16 @@ let inactiveCallMediaSources: CallMediaSources = {
 let activeCall: Call | undefined
 let notConnectedCall: NotConnectedCall | undefined
 let answerTimeout = 30_000
+// Reconnection timings. "disconnected" is reported on the first unanswered consent check (checks run every
+// 4-6 seconds, RFC 7675), so most of the interruptions that reach us heal without doing anything at all.
+const reconnectGrace = 2_000
+// How long after the network came back a lost connection is still attributed to that change. It has to
+// cover how late WebRTC notices: consent checks run every 4-6 seconds, so "disconnected" can lag the actual
+// loss by that much, and on a handover the network is usually back before the loss is even reported.
+const reconnectAfterOnline = 10_000
+const reconnectAttemptTimeout = 10_000
+const reconnectBudget = 60_000
+const reconnectCheckInterval = 2_000
 var useWorker = false
 var isDesktop = false
 var localizedState = ""
@@ -371,10 +432,21 @@ const processCommand = (function () {
     }
   }
 
-  function getIceCandidates(conn: RTCPeerConnection, config: CallConfig) {
-    return new Promise<string>((resolve, _) => {
+  // Cancels the timers of the previous ICE generation, so that its leftovers are not sent after a restart
+  let stopIceGathering: (() => void) | undefined
+  // kept for the restarts, which re-gather candidates with the same timings as the initial exchange
+  let currentCallConfig: CallConfig | undefined
+  // when the network last came back, see reconnectAfterOnline
+  let lastOnlineAt = 0
+
+  // generation 0 is the initial gathering, it sends a bare array of candidates; a restart generation tags
+  // them, so that the peer can drop the candidates of a generation it has already superseded
+  function getIceCandidates(conn: RTCPeerConnection, config: CallConfig, generation = 0) {
+    stopIceGathering?.()
+    return new Promise<RTCIceCandidate[]>((resolve, _) => {
       let candidates: RTCIceCandidate[] = []
       let resolved = false
+      let stopped = false
       let extrasInterval: number | undefined
       let extrasTimeout: number | undefined
       const delay = setTimeout(() => {
@@ -389,6 +461,14 @@ const processCommand = (function () {
           }, config.iceCandidates.extrasTimeout)
         }
       }, config.iceCandidates.delay)
+
+      stopIceGathering = () => {
+        stopped = true
+        clearTimeout(delay)
+        if (extrasInterval) clearInterval(extrasInterval)
+        if (extrasTimeout) clearTimeout(extrasTimeout)
+        if (!resolved) resolve([])
+      }
 
       conn.onicecandidate = ({candidate: c}) => c && candidates.push(c)
       conn.onicegatheringstatechange = () => {
@@ -408,23 +488,24 @@ const processCommand = (function () {
         resolved = true
         // console.log("resolveIceCandidates", JSON.stringify(candidates))
         console.log("resolveIceCandidates")
-        const iceCandidates = serialize(candidates)
+        const initial = candidates
         candidates = []
-        resolve(iceCandidates)
+        resolve(initial)
       }
 
       function sendIceCandidates() {
-        if (candidates.length === 0) return
+        if (stopped || candidates.length === 0) return
         // console.log("sendIceCandidates", JSON.stringify(candidates))
         console.log("sendIceCandidates")
-        const iceCandidates = serialize(candidates)
+        const cs = candidates
         candidates = []
+        const iceCandidates = generation > 0 ? serialize({t: "candidates", gen: generation, candidates: cs}) : serialize(cs)
         sendMessageToNative({resp: {type: "ice", iceCandidates}})
       }
     })
   }
 
-  async function initializeCall(config: CallConfig, mediaType: CallMediaType, aesKey?: string): Promise<Call> {
+  async function initializeCall(config: CallConfig, mediaType: CallMediaType, isOfferer: boolean, aesKey?: string): Promise<Call> {
     let pc: RTCPeerConnection
     try {
       pc = new RTCPeerConnection(config.peerConnectionConfig)
@@ -459,6 +540,7 @@ const processCommand = (function () {
       }
     }
     const localScreenStream = new MediaStream()
+    currentCallConfig = config
     // Will become video when any video tracks will be added
     const iceCandidates = getIceCandidates(pc, config)
     const call: Call = {
@@ -486,6 +568,11 @@ const processCommand = (function () {
       layout: notConnectedCall?.layout ?? LayoutType.Default,
       cameraTrackWasSetBefore: localStream.getVideoTracks().length > 0,
       peerHasOldVersion: false,
+      isOfferer,
+      peerSupportsReconnect: false,
+      wasConnected: false,
+      restartGen: 0,
+      appliedGen: 0,
     }
     localOrPeerMediaSourcesChanged(call)
     await setupMediaStreams(call)
@@ -498,35 +585,31 @@ const processCommand = (function () {
     return call
 
     async function connectionStateChange() {
-      // "failed" means the second party did not answer in time (15 sec timeout in Chrome WebView)
-      // See https://source.chromium.org/chromium/chromium/src/+/main:third_party/webrtc/p2p/base/p2p_constants.cc;l=70)
-      if (pc.connectionState !== "failed") connectionHandler()
+      // Before the call connects, "failed" only means the second party did not answer in time
+      // (15 sec timeout in Chrome WebView, see
+      // https://source.chromium.org/chromium/chromium/src/+/main:third_party/webrtc/p2p/base/p2p_constants.cc;l=70),
+      // and the call is ended by connectionTimeout instead. After it connected, "failed" is a lost connection
+      // that has to be handled, otherwise the call hangs with frozen media.
+      if (pc.connectionState !== "failed" || call.wasConnected) connectionHandler()
     }
 
     async function connectionHandler() {
-      sendMessageToNative({
-        resp: {
-          type: "connection",
-          state: {
-            connectionState:
-              pc.connectionState ??
-              (pc.iceConnectionState != "completed" && pc.iceConnectionState != "checking"
-                ? pc.iceConnectionState
-                : pc.iceConnectionState == "completed"
-                ? "connected"
-                : "connecting") /* webView 69-70 doesn't have connectionState yet */,
-            iceConnectionState: pc.iceConnectionState,
-            iceGatheringState: pc.iceGatheringState,
-            signalingState: pc.signalingState,
-          },
-        },
-      })
-      if (
-        pc.connectionState == "disconnected" ||
-        pc.connectionState == "failed" ||
-        (!pc.connectionState && (pc.iceConnectionState == "disconnected" || pc.iceConnectionState == "failed"))
-      ) {
+      const lost = isLost(pc)
+      const connected = isConnected(pc)
+      // Nothing but "reconnecting" is reported while the call is recovering, until it is connected again.
+      // "disconnected" would mark the call item as ended, which is not reversible, and the intermediate
+      // "connecting" of an ICE restart would move it back to negotiated, losing the call duration if the
+      // call is then ended. See spec/services/calls.md#reconnection
+      const reconnecting = lost ? canReconnect(call) : !!call.reconnect && !connected
+      sendConnectionState(pc, reconnecting ? "reconnecting" : undefined)
+      if (lost) {
         clearConnectionTimeout()
+        if (reconnecting) {
+          // the listener stays attached, the connection and its media pipeline are kept;
+          // the state was reported just above
+          enterReconnecting(call, false)
+          return
+        }
         if (pc.connectionState) {
           pc.removeEventListener("connectionstatechange", connectionStateChange)
         } else {
@@ -536,8 +619,10 @@ const processCommand = (function () {
           setTimeout(() => sendMessageToNative({resp: {type: "ended"}}), 0)
         }
         endCall()
-      } else if (pc.connectionState == "connected" || (!pc.connectionState && pc.iceConnectionState == "connected")) {
+      } else if (connected) {
         clearConnectionTimeout()
+        call.wasConnected = true
+        if (call.reconnect) clearReconnect(call, false) // the state was reported just above
         const stats = (await pc.getStats()) as Map<string, any>
         for (const stat of stats.values()) {
           const {type, state} = stat
@@ -635,7 +720,8 @@ const processCommand = (function () {
           const {media, iceServers, relay} = command
           const encryption = supportsInsertableStreams(useWorker)
           const aesKey = encryption ? command.aesKey : undefined
-          activeCall = await initializeCall(getCallConfig(encryption && !!aesKey, iceServers, relay), media, aesKey)
+          // the party that creates the initial offer is the one that restarts ICE on reconnection
+          activeCall = await initializeCall(getCallConfig(encryption && !!aesKey, iceServers, relay), media, true, aesKey)
           await setupLocalStream(true, activeCall)
           setupCodecPreferences(activeCall)
 
@@ -659,8 +745,8 @@ const processCommand = (function () {
           // }
           resp = {
             type: "offer",
-            offer: serialize(offer),
-            iceCandidates: await activeCall.iceCandidates,
+            offer: serialize(withReconnectCapability(offer)),
+            iceCandidates: serialize(await activeCall.iceCandidates),
             capabilities: {encryption},
           }
           // console.log("offer response", JSON.stringify(resp))
@@ -672,10 +758,11 @@ const processCommand = (function () {
           } else if (!supportsInsertableStreams(useWorker) && command.aesKey) {
             resp = {type: "error", message: "accept: encryption is not supported"}
           } else {
-            const offer: RTCSessionDescriptionInit = parse(command.offer)
+            const offer: SessionWithCapability = parse(command.offer)
             const remoteIceCandidates: RTCIceCandidateInit[] = parse(command.iceCandidates)
             const {media, aesKey, iceServers, relay} = command
-            activeCall = await initializeCall(getCallConfig(!!aesKey, iceServers, relay), media, aesKey)
+            activeCall = await initializeCall(getCallConfig(!!aesKey, iceServers, relay), media, false, aesKey)
+            activeCall.peerSupportsReconnect = offer.smpReconnect != null
             const pc = activeCall.connection
             // console.log("offer remoteIceCandidates", JSON.stringify(remoteIceCandidates))
             await pc.setRemoteDescription(new RTCSessionDescription(!webView69Or70() ? offer : adaptSdpToOldWebView(offer)))
@@ -701,8 +788,8 @@ const processCommand = (function () {
             // same as command for caller to use
             resp = {
               type: "answer",
-              answer: serialize(answer),
-              iceCandidates: await activeCall.iceCandidates,
+              answer: serialize(withReconnectCapability(answer)),
+              iceCandidates: serialize(await activeCall.iceCandidates),
             }
           }
           // console.log("answer response", JSON.stringify(resp))
@@ -715,10 +802,11 @@ const processCommand = (function () {
           } else if (pc.currentRemoteDescription) {
             resp = {type: "error", message: "answer: remote description already set"}
           } else {
-            const answer: RTCSessionDescriptionInit = parse(command.answer)
+            const answer: SessionWithCapability = parse(command.answer)
             const remoteIceCandidates: RTCIceCandidateInit[] = parse(command.iceCandidates)
             // console.log("answer remoteIceCandidates", JSON.stringify(remoteIceCandidates))
 
+            if (activeCall) activeCall.peerSupportsReconnect = answer.smpReconnect != null
             await pc.setRemoteDescription(new RTCSessionDescription(!webView69Or70() ? answer : adaptSdpToOldWebView(answer)))
             adaptToOldVersion(pc.getTransceivers()[2].currentDirection == "sendonly", activeCall!)
             addIceCandidates(pc, remoteIceCandidates)
@@ -728,12 +816,30 @@ const processCommand = (function () {
           }
           break
         case "ice":
-          const remoteIceCandidates: RTCIceCandidateInit[] = parse(command.iceCandidates)
-          if (pc) {
-            addIceCandidates(pc, remoteIceCandidates)
+          // an array is candidates, an object is a reconnection message - see ReconnectMessage
+          const icePayload: RTCIceCandidateInit[] | ReconnectMessage = parse(command.iceCandidates)
+          if (!Array.isArray(icePayload)) {
+            if (!activeCall) {
+              resp = {type: "error", message: "ice: reconnection message without a call"}
+            } else {
+              switch (icePayload.t) {
+                case "restartOffer":
+                  await receivedRestartOffer(activeCall, icePayload)
+                  break
+                case "restartAnswer":
+                  await receivedRestartAnswer(activeCall, icePayload)
+                  break
+                case "candidates":
+                  receivedRestartCandidates(activeCall, icePayload)
+                  break
+              }
+              resp = {type: "ok"}
+            }
+          } else if (pc) {
+            addIceCandidates(pc, icePayload)
             resp = {type: "ok"}
           } else {
-            afterCallInitializedCandidates.push(...remoteIceCandidates)
+            afterCallInitializedCandidates.push(...icePayload)
             resp = {type: "error", message: "ice: call not started yet, will add candidates later"}
           }
           break
@@ -833,8 +939,256 @@ const processCommand = (function () {
     return apiResp
   }
 
+  // A connection that was established and is lost again is not a failure: the candidate pair may have been
+  // invalidated by a network handover, or a single consent check may have gone unanswered. Instead of ending
+  // the call, ICE is restarted over the chat connection, which survives the network change on its own.
+  // Spec: spec/services/calls.md#reconnection
+
+  function isLost(pc: RTCPeerConnection): boolean {
+    return (
+      pc.connectionState == "disconnected" ||
+      pc.connectionState == "failed" ||
+      (!pc.connectionState && (pc.iceConnectionState == "disconnected" || pc.iceConnectionState == "failed"))
+    )
+  }
+
+  // "completed" is also connected, and ICE may go from "checking" straight to it, skipping "connected"
+  function isConnected(pc: RTCPeerConnection): boolean {
+    return (
+      pc.connectionState == "connected" ||
+      (!pc.connectionState && (pc.iceConnectionState == "connected" || pc.iceConnectionState == "completed"))
+    )
+  }
+
+  function sendConnectionState(pc: RTCPeerConnection, override?: string) {
+    sendMessageToNative({
+      resp: {
+        type: "connection",
+        state: {
+          connectionState:
+            override ??
+            pc.connectionState ??
+            (pc.iceConnectionState != "completed" && pc.iceConnectionState != "checking"
+              ? pc.iceConnectionState
+              : pc.iceConnectionState == "completed"
+              ? "connected"
+              : "connecting") /* webView 69-70 doesn't have connectionState yet */,
+          iceConnectionState: pc.iceConnectionState,
+          iceGatheringState: pc.iceGatheringState,
+          signalingState: pc.signalingState,
+        },
+      },
+    })
+  }
+
+  function canReconnect(call: Call): boolean {
+    return (
+      call === activeCall &&
+      call.wasConnected &&
+      call.peerSupportsReconnect &&
+      // an old web view cannot apply a restart description (see adaptSdpToOldWebView) and does not announce support
+      !webView69Or70() &&
+      (!call.reconnect || Date.now() - call.reconnect.since < reconnectBudget)
+    )
+  }
+
+  function enterReconnecting(call: Call, notify: boolean) {
+    if (call.reconnect) return
+    console.log("reconnect: connection lost, reconnecting")
+    const r: ReconnectState = {since: Date.now(), pendingCandidates: []}
+    call.reconnect = r
+    // the answering side enters this from a restart offer, before its own connection reported anything
+    if (notify) sendConnectionState(call.connection, "reconnecting")
+    r.budgetTimer = setTimeout(() => failReconnect(call), reconnectBudget)
+    r.checkTimer = setInterval(() => {
+      if (isConnected(call.connection)) clearReconnect(call, true)
+    }, reconnectCheckInterval)
+    // only the party that made the initial offer restarts, the other one waits for the offer - no glare
+    if (call.isOfferer) {
+      // A loss that follows the network coming back is that network change: the candidate pair is dead for
+      // certain and there is nothing for the grace period to heal. This is the usual order on a handover -
+      // the new network is validated seconds before WebRTC reports the loss - so waiting out the grace here
+      // is what the online event was meant to avoid.
+      const afterNetworkChange = Date.now() - lastOnlineAt < reconnectAfterOnline
+      if (afterNetworkChange) console.log("reconnect: the network changed just before the loss, restarting at once")
+      scheduleRestartOffer(call, afterNetworkChange ? 0 : reconnectGrace)
+    }
+  }
+
+  function scheduleRestartOffer(call: Call, delay: number) {
+    const r = call.reconnect
+    if (!r) return
+    // both timers lead to sendRestartOffer, keeping only one avoids two offers of consecutive generations
+    if (r.graceTimer) clearTimeout(r.graceTimer)
+    if (r.attemptTimer) clearTimeout(r.attemptTimer)
+    r.graceTimer = setTimeout(() => sendRestartOffer(call), delay)
+  }
+
+  async function sendRestartOffer(call: Call) {
+    const r = call.reconnect
+    const config = currentCallConfig
+    if (!r || !config || call !== activeCall) return
+    // restarts are repeated until the budget runs out. TODO a further tier - a new peer connection with the
+    // same key and local streams - would also recover the cases where the transport itself is gone, not only
+    // the candidate pair (e.g. a DTLS failure), which no number of ICE restarts fixes.
+    const gen = ++call.restartGen
+    r.pendingCandidates = []
+    const pc = call.connection
+    try {
+      // re-armed before the description is set, so that the candidates of this generation are not missed
+      const gathering = getIceCandidates(pc, config, gen)
+      const offer = await pc.createOffer({iceRestart: true})
+      if (!offer.sdp) throw Error("restart offer without sdp")
+      await pc.setLocalDescription(offer)
+      const candidates = await gathering
+      // gathering takes up to iceCandidates.delay, a network event may have started a newer generation
+      // in the meantime - sending this one now would only add a round trip
+      if (gen != call.restartGen) {
+        console.log("reconnect: dropping superseded restart offer, generation " + gen)
+        return
+      }
+      console.log("reconnect: sending restart offer, generation " + gen)
+      sendReconnectMessage({t: "restartOffer", gen, sdp: offer.sdp, candidates})
+    } catch (e) {
+      // a transient failure only costs this generation, the next attempt is still within the budget
+      console.log("reconnect: failed to create restart offer", e)
+      // only if a newer generation has not taken the gathering over in the meantime - stopIceGathering
+      // always points at the latest one, and cancelling it would leave that offer without candidates
+      if (gen == call.restartGen) stopIceGathering?.()
+    }
+    if (r.attemptTimer) clearTimeout(r.attemptTimer)
+    r.attemptTimer = setTimeout(() => sendRestartOffer(call), reconnectAttemptTimeout)
+  }
+
+  async function receivedRestartOffer(call: Call, msg: RestartSession) {
+    const config = currentCallConfig
+    if (call.isOfferer || !config) return
+    // an offer that was already applied, or was superseded while in flight, is not a reason to reconnect
+    if (msg.gen <= call.appliedGen) {
+      console.log("reconnect: ignoring restart offer of generation " + msg.gen)
+      return
+    }
+    const pc = call.connection
+    if (!sameMediaSections(pc.remoteDescription?.sdp, msg.sdp)) {
+      console.log("reconnect: restart offer changes the media of the call, ending")
+      failReconnect(call)
+      return
+    }
+    // the peer may have noticed the loss before this side did
+    enterReconnecting(call, !isConnected(pc))
+    const r = call.reconnect
+    if (!r) return
+    call.restartGen = msg.gen
+    r.pendingCandidates = []
+    try {
+      const gathering = getIceCandidates(pc, config, msg.gen)
+      await pc.setRemoteDescription(new RTCSessionDescription({type: "offer", sdp: msg.sdp}))
+      const answer = await pc.createAnswer()
+      if (!answer.sdp) throw Error("restart answer without sdp")
+      await pc.setLocalDescription(answer)
+      call.appliedGen = msg.gen
+      addIceCandidates(pc, msg.candidates)
+      addPendingCandidates(call)
+      console.log("reconnect: sending restart answer, generation " + msg.gen)
+      sendReconnectMessage({t: "restartAnswer", gen: msg.gen, sdp: answer.sdp, candidates: await gathering})
+    } catch (e) {
+      // this generation is dropped, the offerer repeats with the next one while the budget lasts
+      console.log("reconnect: failed to answer restart offer, waiting for the next one", e)
+    }
+  }
+
+  async function receivedRestartAnswer(call: Call, msg: RestartSession) {
+    const r = call.reconnect
+    if (!call.isOfferer || !r || msg.gen != call.restartGen || call.appliedGen == msg.gen) return
+    const pc = call.connection
+    if (!sameMediaSections(pc.remoteDescription?.sdp, msg.sdp)) {
+      console.log("reconnect: restart answer changes the media of the call, ending")
+      failReconnect(call)
+      return
+    }
+    try {
+      await pc.setRemoteDescription(new RTCSessionDescription({type: "answer", sdp: msg.sdp}))
+      call.appliedGen = msg.gen
+      addIceCandidates(pc, msg.candidates)
+      addPendingCandidates(call)
+      console.log("reconnect: restart answer applied, generation " + msg.gen)
+    } catch (e) {
+      console.log("reconnect: failed to apply restart answer, waiting for the next attempt", e)
+    }
+  }
+
+  function receivedRestartCandidates(call: Call, msg: RestartCandidates) {
+    const r = call.reconnect
+    if (!r || msg.gen < call.restartGen) return
+    if (msg.gen == call.appliedGen) {
+      addIceCandidates(call.connection, msg.candidates)
+    } else {
+      // the description of this generation is not applied yet - its candidates would be rejected
+      r.pendingCandidates.push(...msg.candidates)
+    }
+  }
+
+  function addPendingCandidates(call: Call) {
+    const r = call.reconnect
+    if (!r || r.pendingCandidates.length == 0) return
+    addIceCandidates(call.connection, r.pendingCandidates)
+    r.pendingCandidates = []
+  }
+
+  function sendReconnectMessage(msg: ReconnectMessage) {
+    sendMessageToNative({resp: {type: "ice", iceCandidates: serialize(msg)}})
+  }
+
+  function withReconnectCapability(desc: RTCSessionDescriptionInit): SessionWithCapability {
+    return webView69Or70() ? {type: desc.type, sdp: desc.sdp} : {type: desc.type, sdp: desc.sdp, smpReconnect: 1}
+  }
+
+  function clearReconnect(call: Call, notify: boolean) {
+    const r = call.reconnect
+    if (!r) return
+    console.log("reconnect: connected again after " + (Date.now() - r.since) + "ms")
+    stopReconnect(call)
+    // the recovery may have been noticed by the poller rather than by a connection state change,
+    // in which case the native layer is still showing the call as reconnecting
+    if (notify) sendConnectionState(call.connection)
+  }
+
+  function stopReconnect(call: Call) {
+    const r = call.reconnect
+    if (!r) return
+    if (r.graceTimer) clearTimeout(r.graceTimer)
+    if (r.attemptTimer) clearTimeout(r.attemptTimer)
+    if (r.budgetTimer) clearTimeout(r.budgetTimer)
+    if (r.checkTimer) clearInterval(r.checkTimer)
+    call.reconnect = undefined
+  }
+
+  function failReconnect(call: Call) {
+    stopReconnect(call)
+    console.log("reconnect: giving up, ending the call")
+    if (activeCall) setTimeout(() => sendMessageToNative({resp: {type: "ended"}}), 0)
+    endCall()
+  }
+
+  // An ICE restart may not change the media of the call - it would let the peer add a track mid-call
+  function sameMediaSections(sdp1?: string, sdp2?: string): boolean {
+    const m1 = mediaSections(sdp1)
+    const m2 = mediaSections(sdp2)
+    return m1.length > 0 && m1.length == m2.length && m1.every((m, i) => m == m2[i])
+  }
+
+  function mediaSections(sdp?: string): string[] {
+    return (sdp ?? "")
+      .split("\n")
+      .filter((line) => line.startsWith("m="))
+      .map((line) => line.split(" ")[0])
+  }
+
   function endCall() {
     shutdownCameraAndMic()
+    if (activeCall) stopReconnect(activeCall)
+    stopIceGathering?.()
+    stopIceGathering = undefined
     try {
       activeCall?.connection?.close()
     } catch (e) {
@@ -1555,6 +1909,21 @@ const processCommand = (function () {
       }
     })
     return {sdp: res.join("\n"), type: desc.type}
+  }
+
+  // Recovering a handover without waiting out the grace period: the local address is already back,
+  // there is no point in waiting for ICE to notice that the old candidate pair is dead.
+  if (typeof window !== "undefined") {
+    window.addEventListener("online", () => {
+      const call = activeCall
+      lastOnlineAt = Date.now()
+      // Logged before the condition on purpose: on Android this event only fires if the app forwards the
+      // network state with setNetworkAvailable, and a restart is only scheduled on the restarting side
+      // while a reconnection is running - so the log of a restart does not tell whether the event arrives.
+      console.log(`reconnect: online event, reconnecting: ${!!call?.reconnect}, offerer: ${!!call?.isOfferer}`)
+      // the event can come before or after the loss is reported, each order is handled on its own side
+      if (call?.reconnect && call.isOfferer) scheduleRestartOffer(call, 0)
+    })
   }
 
   return processCommand

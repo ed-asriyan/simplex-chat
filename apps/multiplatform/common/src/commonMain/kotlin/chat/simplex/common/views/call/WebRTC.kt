@@ -44,6 +44,11 @@ data class Call(
 
   val hasVideo: Boolean
     get() = localMediaSources.hasVideo || peerMediaSources.hasVideo
+
+  // a call that is reconnecting keeps its media pipeline and its granted permissions - it is a connected
+  // call with a temporarily dead transport, see spec/services/calls.md#reconnection
+  val connectedOrReconnecting: Boolean
+    get() = callState == CallState.Connected || callState == CallState.Reconnecting
 }
 
 // Spec: spec/services/calls.md#CallState
@@ -56,6 +61,7 @@ enum class CallState {
   AnswerReceived,
   Negotiated,
   Connected,
+  Reconnecting,
   Ended;
 
   val text: String get() = when(this) {
@@ -67,6 +73,7 @@ enum class CallState {
     AnswerReceived -> generalGetString(MR.strings.callstate_received_confirmation)
     Negotiated -> generalGetString(MR.strings.callstate_connecting)
     Connected -> generalGetString(MR.strings.callstate_connected)
+    Reconnecting -> generalGetString(MR.strings.callstate_reconnecting)
     Ended -> generalGetString(MR.strings.callstate_ended)
   }
 }

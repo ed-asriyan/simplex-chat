@@ -53,6 +53,7 @@ import dev.icerock.moko.resources.compose.painterResource
 import dev.icerock.moko.resources.compose.stringResource
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.drop
 import kotlinx.coroutines.flow.filterNotNull
 import kotlinx.datetime.Clock
 import kotlinx.serialization.encodeToString
@@ -170,11 +171,19 @@ actual fun ActiveCallView() {
           is WCallResponse.Ice -> withBGApi {
             chatModel.controller.apiSendCallExtraInfo(callRh, call.contact, r.iceCandidates)
           }
+          // The call is not reported as disconnected to the core while it is reconnecting: that would mark the
+          // call item as ended, irreversibly. Spec: spec/services/calls.md#reconnection
           is WCallResponse.Connection ->
-            try {
+            if (r.state.connectionState == "reconnecting") {
+              // the state is reported on every connection state change while reconnecting, the sound starts once
+              if (call.callState != CallState.Reconnecting) CallSoundsPlayer.startConnectingCallSound(scope)
+              updateActiveCall(call) { it.copy(callState = CallState.Reconnecting) }
+            } else try {
               val callStatus = json.decodeFromString<WebRTCCallStatus>("\"${r.state.connectionState}\"")
               if (callStatus == WebRTCCallStatus.Connected) {
-                updateActiveCall(call) { it.copy(callState = CallState.Connected, connectedAt = Clock.System.now()) }
+                if (call.callState == CallState.Reconnecting) CallSoundsPlayer.stop()
+                // on reconnection connectedAt is kept, the call duration is not restarted
+                updateActiveCall(call) { it.copy(callState = CallState.Connected, connectedAt = it.connectedAt ?: Clock.System.now()) }
               }
               withBGApi { chatModel.controller.apiCallStatus(callRh, call.contact, callStatus) }
             } catch (e: Throwable) {
@@ -704,6 +713,22 @@ fun WebRTCView(callCommand: SnapshotStateList<WCallCommand>, onResponse: (WVAPIM
   }
   val wv = webView.value
   if (wv != null) {
+    // Without this the web view reports navigator.onLine as true regardless of the real state and never fires
+    // online/offline, so the call page cannot react to a network handover. NetworkObserver already has the
+    // validated network state, this only forwards it. Spec: spec/services/calls.md#reconnection
+    LaunchedEffect(Unit) {
+      snapshotFlow { chatModel.networkInfo.value }
+        .distinctUntilChanged()
+        .drop(1) // the state at the start of the call is what the web view already assumes
+        .collect { info ->
+          Log.d(TAG, "WebRTCView network changed: $info")
+          // A handover is reported as a change of network type while online never becomes false
+          // (NetworkObserver debounces the offline state by 3 seconds), so the event that the call page
+          // waits for is forced by toggling the property.
+          wv.setNetworkAvailable(false)
+          if (info.online) wv.setNetworkAvailable(true)
+        }
+    }
     LaunchedEffect(Unit) {
       snapshotFlow { callCommand.firstOrNull() }
         .distinctUntilChanged()
